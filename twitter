@@ -1,0 +1,214 @@
+#!/ports/bin/perl
+
+use Modern::Perl;
+
+use Config::Std;
+use File::Path;
+use Getopt::Long    qw( :config bundling );
+use IO::All         -utf8;
+use JSON::Any;
+use Net::Twitter;
+use Pod::Usage;
+use Readonly;
+
+Readonly my $PROGRAM_VERSION     => '1.0';
+Readonly my $MAX_TWEETS_PER_PAGE => 200;
+Readonly my $DEFAULT_RATE_LIMIT  => 0;
+Readonly my $EXCEEDED_RATE_LIMIT => 120;
+Readonly my $DEFAULT_CONFIG_FILE => 'collectors.conf';
+Readonly my @OPTIONS             => qw(
+        config|c=s
+        help|h
+        per-page|p=i
+        rate-limit|r=i
+        status|s
+        version|v
+    );
+
+
+my %option = (
+        'per-page'   => $MAX_TWEETS_PER_PAGE,
+        'config'     => $DEFAULT_CONFIG_FILE,
+        'rate-limit' => $DEFAULT_RATE_LIMIT,
+    );
+my $known = GetOptions( \%option, @OPTIONS );
+
+pod2usage()  if !$known or $option{'help'};
+version()    if $option{'version'};
+
+read_config $option{'config'} => my %config;
+
+my $last_tweet   = $config{'_status'}{'last_tweet'} // 0;
+my $latest_tweet = $last_tweet;
+my $count        = 0;
+my $page         = 1;
+
+my $twitter = Net::Twitter->new( %{ $config{'twitter'} } )
+              or die "No twitter: $!";
+
+
+FETCH_LOOP:
+while ( 'true' ) {
+    my %timeline_options = (
+            count    => $option{'per-page'},
+            page     => $page,
+        );
+    if ( $last_tweet ) {
+        $timeline_options{'since_id'} = $last_tweet;
+    }
+
+    my $timeline = get_user_timeline( $twitter, \%timeline_options );
+    last FETCH_LOOP  if !defined $timeline;
+    
+    foreach my $tweet ( @{ $timeline } ) {
+        my $id        = $tweet->{'id'};
+        my $timestamp = parse_timestamp( $tweet->{'created_at'} );
+        my $directory = sprintf '%04d/%02d/%02d',
+                            $timestamp->{'year'}, 
+                            $timestamp->{'month'},
+                            $timestamp->{'day'};
+        my $file      = sprintf '%s/%02d.%02d.%02d.%d.status',
+                            $directory,
+                            $timestamp->{'hour'},
+                            $timestamp->{'minute'},
+                            $timestamp->{'second'},
+                            $id;
+        my $output    = join "\n",
+                            'source = ' . $tweet->{'source'},
+                            'text   = ' . $tweet->{'text'},
+                            'id     = ' . $id;
+        
+        $latest_tweet = $id  if $id > $latest_tweet;
+        
+        mkpath $directory;
+        io( $file )->print( "$output\n" );
+        say $file  if $option{'status'};
+        $count++;
+    }
+    $page++;
+}
+
+$config{'_status'}{'last_tweet'} = $latest_tweet;
+write_config %config;
+exit;
+
+
+sub get_user_timeline {
+    my $twitter = shift;
+    my $options = shift;
+    
+    my $timeline;
+    while ( !defined $timeline ) {
+        $timeline = $twitter->user_timeline( $options );
+        sleep $option{'rate-limit'};
+        
+        if ( !defined $timeline ) {
+            my $json   = JSON::Any->new();
+            my $return = $json->decode( $twitter->get_error() );
+            
+            if ( $return->{'error'} =~ m{^Rate limit exceeded.} ) {
+                say '** rate limit exceeded, sleeping'  if $option{'status'};
+                sleep $EXCEEDED_RATE_LIMIT;
+            }
+            else {
+                die $return->{'error'};
+            }
+        }
+        else {
+            my $result_count = scalar @{ $timeline };
+            return undef  if 0 == $result_count;
+        }
+    }
+    
+    return $timeline;
+}
+
+
+sub parse_timestamp {
+    my $timestamp = shift;
+    my %months = (
+            Jan => 1,  Feb => 2,  Mar => 3,  Apr => 4,  May => 5,  Jun => 6,
+            Jul => 7,  Aug => 8,  Sep => 9,  Oct => 10, Nov => 11, Dec => 12,
+        );
+    
+    # regular expression to parse the twitter timestamp
+    # (why couldn't they just use an actual standard format, like ISO 8601?)
+    $timestamp =~ m{
+            \w+                 \s+     # Wed
+            (\w+)               \s+     # Feb
+            (\d+)               \s+     # 18
+            (\d+):(\d+):(\d+)   \s+     # 19:57:37
+            [+-]\d+             \s+     # +0000     # TZs broken in API...
+            (\d+)                       # 2009
+        }x;
+    
+    return {
+            month   => $months{$1},
+            day     => $2,
+            hour    => $3,
+            minute  => $4,
+            second  => $5,
+            year    => $6
+        };
+}
+
+
+sub version {
+    say "twitter collector version $VERSION";
+}
+
+__END__
+
+=pod
+
+=head1 NAME
+
+B<twitter> - collect personal data from twitter.com
+
+=head1 SYNOPSIS
+
+B<twitter> [-h] 
+
+B<twitter> [-c file] [-p number] [-r seconds] [-s]
+
+B<twitter> [--config file] [--per-page number] [--rate-limit seconds] [--status]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-h> | B<--help>
+
+print the synopsis and options part of the script documentation
+
+=item B<-c> I<file> | B<-config> I<file>
+
+use I<file> as the file in which to find configuration options (username, password, etc.) to be used. Defaults to C<collectors.conf>.
+
+=item B<p> I<number> | B<--per-page> I<number>
+
+request I<number> tweets at once from the Twitter API. Defaults to C<200>,
+which is also the maximum that can be requested from Twitter at one time.
+
+=item B<r> I<seconds> | B<--rate-limit> I<seconds>
+
+wait I<seconds> between each request made to the Twitter API.
+
+=item B<-s> | B<--status>
+
+print status updates as to what the script is doing. Currently these are:
+
+=over
+
+=item the filename of any new tweets found
+
+=item notifications that the rate limit has been exceeded and the script 
+is sleeping
+
+=back
+
+=back
+
+=head1 AUTHOR
+
+Mark Norman Francis <norm@cackhanded.net>
